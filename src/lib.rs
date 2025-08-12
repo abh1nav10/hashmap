@@ -153,14 +153,14 @@ mod tests {
     #[test]
     fn iter() {
         let mut new = HashMap::new();
-        new.insert("Abhinav", "Subhi");
-        new.insert("Subhi", "Cat");
-        new.insert("Abhinav2", "Rustacean");
+        new.insert("foo", "hello");
+        new.insert("check", "checker");
+        new.insert("rust", "Rustacean");
         for ((&key, &value)) in new.into_iter() {
             match key {
-                "Abhinav" => assert_eq!(value, "Subhi"),
-                "Subhi" => assert_eq!(value, "Cat"),
-                "Abhinav2" => assert_eq!(value, "Rustacean"),
+                "foo" => assert_eq!(value, "hello"),
+                "check" => assert_eq!(value, "checker"),
+                "rust" => assert_eq!(value, "Rustacean"),
                 _ => unreachable!(),
             }
             assert_eq!(new.size(), 3);

@@ -1,5 +1,16 @@
 #![allow(unused)]
 
+//! Unsafe code in this module has been written keeping in mind two reasons:
+//!
+//!  1. Indexing with numbers that are guaranteed to be in-bounds does not
+//!     not require bounds checking. Hence the `unsafe` counterparts of that
+//!     can be used.
+//!  2. Calling methods on `MaybeUninit` that assume that it is initialized is
+//!     `unsafe` and we have used those methhods in the implementation only in
+//!     those cases where the underlying `metadata` for that slot assures that
+//!     the slot is `OCCUPIED`. In other cases, we refrain from calling those
+//!     methods.
+
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash, RandomState};
 use std::mem::MaybeUninit;
@@ -13,8 +24,26 @@ pub struct HashTable<K, V, S> {
     length: usize,
 }
 
+impl<K, V, S> Drop for HashTable<K, V, S> {
+    fn drop(&mut self) {
+        for (index, &element) in self.metadata.iter().enumerate() {
+            if element == OCCUPIED {
+                unsafe {
+                    self.pairs.get_unchecked_mut(index).assume_init_drop();
+                }
+            }
+        }
+    }
+}
+
+impl<K, V> Default for HashTable<K, V, RandomState> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<K, V> HashTable<K, V, RandomState> {
-    pub fn with_default_buildhasher() -> Self {
+    pub fn new() -> Self {
         Self {
             pairs: Vec::new().into_boxed_slice(),
             metadata: Vec::new().into_boxed_slice(),
@@ -62,23 +91,26 @@ where
 
         self.length = 0;
 
-        let mut old_vec = (0..new_capacity)
-            .map(|_| MaybeUninit::uninit())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        // let mut old_vec = (0..new_capacity)
+        //     .map(|_| MaybeUninit::uninit())
+        //     .collect::<Vec<_>>()
+        //     .into_boxed_slice();
 
-        let mut old_metadata = (0..new_capacity)
-            .map(|_| EMPTY)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let mut old_vector = Vec::with_capacity(new_capacity);
+        unsafe {
+            old_vector.set_len(new_capacity);
+        }
+        let mut old_vec = old_vector.into_boxed_slice();
+
+        let mut old_metadata = vec![EMPTY; new_capacity].into_boxed_slice();
 
         std::mem::swap(&mut old_vec, &mut self.pairs);
         std::mem::swap(&mut old_metadata, &mut self.metadata);
 
-        let mut old_metadata = old_metadata.into_iter();
+        let mut old_meta = old_metadata.into_iter();
 
         for (index, element) in old_vec.into_iter().enumerate() {
-            let next_meta = old_metadata
+            let next_meta = old_meta
                 .next()
                 .expect("Metadata and pairs have the same length");
             if next_meta == OCCUPIED {
@@ -95,25 +127,27 @@ where
 
         let mut hash = self.hash(&key);
 
-        let mut current = self.metadata[hash];
+        let mut current = unsafe { *self.metadata.get_unchecked(hash) };
 
         // Since the capacity is greater than length, it is guaranteed that the iteration is going
         // to find an empty slot before it reaches back to the original hash % capacity.
         loop {
             if current == EMPTY || current == TOMBSTONED {
-                self.pairs[hash].write((key, value));
-                self.metadata[hash] = OCCUPIED;
+                unsafe {
+                    self.pairs.get_unchecked_mut(hash).write((key, value));
+                    *self.metadata.get_unchecked_mut(hash) = OCCUPIED;
+                }
                 self.length += 1;
                 return None;
             } else {
-                let inner = unsafe { self.pairs[hash].assume_init_mut() };
+                let inner = unsafe { self.pairs.get_unchecked_mut(hash).assume_init_mut() };
                 if inner.0 == key {
                     let mut old = value;
                     std::mem::swap(&mut inner.1, &mut old);
                     return Some(old);
                 }
                 hash = (hash + 1) & (self.capacity - 1);
-                current = self.metadata[hash];
+                current = unsafe { *self.metadata.get_unchecked(hash) };
             }
         }
         None
@@ -125,7 +159,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut hash = self.hash(&key);
-        let mut current = self.metadata[hash];
+        let mut current = unsafe { *self.metadata.get_unchecked(hash) };
 
         let pivot = hash;
 
@@ -133,13 +167,13 @@ where
             if current == EMPTY {
                 return None;
             } else if current == OCCUPIED {
-                let inner = unsafe { self.pairs[hash].assume_init_ref() };
+                let inner = unsafe { self.pairs.get_unchecked(hash).assume_init_ref() };
                 if inner.0.borrow() == key {
                     return Some(&inner.1);
                 }
             }
             hash = (hash + 1) & (self.capacity - 1);
-            current = self.metadata[hash];
+            current = unsafe { *self.metadata.get_unchecked(hash) };
             if hash == pivot {
                 return None;
             }
@@ -153,7 +187,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         let mut hash = self.hash(&key);
-        let mut current = self.metadata[hash];
+        let mut current = unsafe { *self.metadata.get_unchecked(hash) };
 
         let pivot = hash;
 
@@ -161,17 +195,19 @@ where
             if current == EMPTY {
                 return None;
             } else if current == OCCUPIED {
-                let inner = unsafe { self.pairs[hash].assume_init_ref() };
+                let inner = unsafe { self.pairs.get_unchecked(hash).assume_init_ref() };
                 if inner.0.borrow() == key {
                     let mut old = MaybeUninit::uninit();
-                    std::mem::swap(&mut self.pairs[hash], &mut old);
+                    std::mem::swap(unsafe { self.pairs.get_unchecked_mut(hash) }, &mut old);
                     let data = unsafe { old.assume_init() };
 
-                    let next = (hash + 1) % self.capacity;
-                    if self.metadata[next] == EMPTY {
-                        self.metadata[hash] = EMPTY;
-                    } else {
-                        self.metadata[hash] = TOMBSTONED;
+                    let next = (hash + 1) & (self.capacity - 1);
+                    unsafe {
+                        if *self.metadata.get_unchecked(next) == EMPTY {
+                            *self.metadata.get_unchecked_mut(hash) = EMPTY;
+                        } else {
+                            *self.metadata.get_unchecked_mut(hash) = TOMBSTONED;
+                        }
                     }
 
                     self.length -= 1;
@@ -180,12 +216,19 @@ where
                 }
             }
             hash = (hash + 1) & (self.capacity - 1);
-            current = self.metadata[hash];
+            current = unsafe { *self.metadata.get_unchecked(hash) };
             if hash == pivot {
                 return None;
             }
         }
         None
+    }
+
+    pub fn iter(&self) -> Iter<'_, K, V, S> {
+        Iter {
+            table: self,
+            status: 0,
+        }
     }
 
     pub fn capacity(&self) -> usize {
@@ -205,10 +248,14 @@ impl<K, V, S> IntoIterator for HashTable<K, V, S> {
     type Item = (K, V);
     type IntoIter = IntoTable<K, V>;
 
-    fn into_iter(self) -> Self::IntoIter {
+    fn into_iter(mut self) -> Self::IntoIter {
+        let mut pairs = Vec::new().into_boxed_slice();
+        let mut metadata = Vec::new().into_boxed_slice();
+        std::mem::swap(&mut self.pairs, &mut pairs);
+        std::mem::swap(&mut self.metadata, &mut metadata);
         IntoTable {
-            pairs: self.pairs.into_iter(),
-            metadata: self.metadata.into_iter(),
+            pairs: pairs.into_iter(),
+            metadata: metadata.into_iter(),
         }
     }
 }
@@ -308,11 +355,8 @@ impl<'a, K, V, S> Iterator for Iter<'a, K, V, S> {
         loop {
             if let Some(meta) = self.table.metadata.get(self.status) {
                 if *meta == OCCUPIED {
-                    let element = self
-                        .table
-                        .pairs
-                        .get(self.status)
-                        .expect("Metadata and pairs have equal length");
+                    // SAFETY: Metedata and pairs have equal length!
+                    let element = unsafe { self.table.pairs.get_unchecked(self.status) };
                     let element = unsafe { element.assume_init_ref() };
                     break Some(element);
                 }
@@ -330,7 +374,7 @@ mod tests {
 
     #[test]
     fn test() {
-        let mut map = HashTable::with_default_buildhasher();
+        let mut map = HashTable::new();
 
         let s = String::from("Abhinav");
         let sport = String::from("Football");
@@ -350,7 +394,7 @@ mod tests {
 
     #[test]
     fn iterator() {
-        let mut map = HashTable::with_default_buildhasher();
+        let mut map = HashTable::new();
         map.insert(1, 2);
         map.insert(2, 4);
         map.insert(3, 6);
@@ -370,7 +414,7 @@ mod tests {
 
     #[test]
     fn measure() {
-        let mut map = HashTable::with_default_buildhasher();
+        let mut map = HashTable::new();
 
         let mut rng = rand::rng();
 
